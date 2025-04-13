@@ -1,0 +1,158 @@
+import requests
+import re
+import socket
+import ssl
+import whois
+import smtplib
+import email
+import imaplib
+import time
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+import datetime
+from email.header import decode_header
+
+def grab_emails(user, pwd, imap_server, num_emails):
+    mail = imaplib.IMAP4_SSL(imap_server)
+    mail.login(user, pwd)
+    mail.select("inbox")
+    _, data = mail.search(None, "ALL")
+    email_ids = data[0].split()[-num_emails:]
+    emails = []
+    for eid in email_ids:
+        _, msg_data = mail.fetch(eid, "(RFC822)")
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+        emails.append(msg)
+    mail.logout()
+    return emails
+
+def decode_subject(subject):
+    decoded = decode_header(subject)[0][0]
+    if isinstance(decoded, bytes):
+        return decoded.decode()
+    return decoded
+
+def check_url(url):
+    try:
+        res = requests.get(url, timeout=5, verify=True)
+        soup = BeautifulSoup(res.text, "html.parser")
+        forms = soup.find_all("form")
+        inputs = soup.find_all("input", {"type": ["password", "text"]})
+        score = 0
+        if len(forms) > 0:
+            score += 30
+        if len(inputs) > 1:
+            score += 20
+        keywords = ["login", "password", "verify", "account", "secure"]
+        for kw in keywords:
+            if kw in res.text.lower():
+                score += 10
+        return score
+    except:
+        return -1
+
+def domain_stuff(url):
+    parsed = urlparse(url)
+    domain = parsed.netloc
+    if domain.startswith("www."):
+        domain = domain[4:]
+    try:
+        w = whois.whois(domain)
+        created = w.creation_date
+        if isinstance(created, list):
+            created = created[0]
+        age = (datetime.datetime.now() - created).days
+        if age < 90:
+            return 40
+        return 0
+    except:
+        return 20
+
+def ssl_check(url):
+    parsed = urlparse(url)
+    hostname = parsed.netloc
+    if not hostname:
+        return 30
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((hostname, 443)) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+                expiry = datetime.datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                if expiry < datetime.datetime.now():
+                    return 50
+                return 0
+    except:
+        return 30
+
+def email_headers(msg):
+    score = 0
+    sender = msg["From"]
+    if sender:
+        if not re.search(r"@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}$", sender):
+            score += 20
+    reply_to = msg["Reply-To"]
+    if reply_to and reply_to != sender:
+        score += 15
+    return score
+
+def find_urls(text):
+    urls = re.findall(r"https?://[^\s<>"]+|www\.[^\s<>"]+", text)
+    return urls
+
+def get_email_body(msg):
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                body += part.get_payload(decode=True).decode()
+            elif part.get_content_type() == "text/html":
+                body += part.get_payload(decode=True).decode()
+    else:
+        body = msg.get_payload(decode=True).decode()
+    return body
+
+def main():
+    username = "your_email@gmail.com"
+    password = "your_app_password"
+    imap_serv = "imap.gmail.com"
+    email_count = 5
+    emails = grab_emails(username, password, imap_serv, email_count)
+    for email_msg in emails:
+        subject = decode_subject(email_msg["Subject"] or "No Subject")
+        print(f"Checking email: {subject}")
+        score = 0
+        body = get_email_body(email_msg)
+        urls = find_urls(body)
+        for u in urls:
+            print(f"  Found URL: {u}")
+            url_score = check_url(u)
+            if url_score == -1:
+                score += 20
+            else:
+                score += url_score
+            dom_score = domain_stuff(u)
+            score += dom_score
+            ssl_score = ssl_check(u)
+            score += ssl_score
+        header_score = email_headers(email_msg)
+        score += header_score
+        bad_words = ["urgent", "login now", "account suspended", "verify now"]
+        for word in bad_words:
+            if word in body.lower() or word in subject.lower():
+                score += 15
+        if len(urls) == 0:
+            score += 10
+        print(f"  Total score: {score}")
+        if score > 80:
+            print("  WARNING: Likely phishing!")
+        elif score > 50:
+            print("  Be cautious, might be suspicious.")
+        else:
+            print("  Looks okay.")
+        print("")
+    time.sleep(2)
+
+if __name__ == "__main__":
+    main()
